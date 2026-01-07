@@ -1,0 +1,9 @@
+ProcessStep;FailureMode;FailureEffect;FailureCause;FailureMeasure;DetectionMeasure;S;O;D;RPN
+Assembly;Bolt missing;Product failure;Operator error;Visual inspection;Check before packaging;8;3;2;48
+Assembly;Wrong torque;Loose connection;Calibration error;Torque verification;Automated torque sensor;7;2;3;42
+Welding;Incomplete weld;Structural weakness;Insufficient power;Weld inspection;X-ray inspection;9;2;4;72
+Welding;Weld spatter;Surface defect;Incorrect settings;Visual check;Post-weld cleaning check;4;5;2;40
+Painting;Uneven coating;Poor appearance;Spray malfunction;Thickness measurement;Coating gauge;5;3;3;45
+Quality Check;Defect not detected;Defective product shipped;Inspector fatigue;Double inspection;Secondary inspector;9;4;6;216
+Packaging;Damaged product;Customer complaint;Rough handling;Package inspection;Pre-ship inspection;6;4;4;96
+Packaging;Missing components;Incomplete product;Inventory error;Component count;Automated counting system;7;3;3;63
