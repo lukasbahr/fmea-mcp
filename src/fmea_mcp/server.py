@@ -278,6 +278,105 @@ async def search_fmea_embeddings(
         return {"success": False, "error": error_msg}
 
 
+@mcp.tool()
+async def answer_fmea_question(
+    question: str,
+    neo4j_url: Optional[str] = None,
+    neo4j_user: Optional[str] = None,
+    neo4j_password: Optional[str] = None,
+    neo4j_database: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
+    ctx: Context[ServerSession, None] = None,
+) -> dict:
+    """
+    Answer questions about FMEA data using a hybrid approach.
+
+    This tool uses a sophisticated hybrid RAG approach:
+    1. First attempts to generate and execute a Cypher graph query
+    2. If unsuccessful, falls back to vector similarity search
+    3. Summarizes retrieved context
+    4. Generates a comprehensive answer using the context
+
+    This approach combines the precision of graph queries with the flexibility
+    of semantic search, ensuring robust question answering even for complex queries.
+
+    Args:
+        question: Natural language question about FMEA data
+        neo4j_url: Neo4j URL (defaults to NEO4J_URL env var)
+        neo4j_user: Neo4j username (defaults to NEO4J_USER env var)
+        neo4j_password: Neo4j password (defaults to NEO4J_PASSWORD env var)
+        neo4j_database: Neo4j database name (defaults to NEO4J_DATABASE env var or 'neo4j')
+        openai_api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
+
+    Returns:
+        dict: Answer with context and metadata including method used (graph_query or vector_search)
+
+    Examples:
+        answer_fmea_question("What are the highest risk failure modes in the assembly process?")
+        answer_fmea_question("What causes weld failures and how can they be prevented?")
+        answer_fmea_question("Which failure modes have RPN above 100?")
+    """
+    if ctx:
+        await ctx.info(f"Answering question: {question}")
+
+    # Get Neo4j credentials from environment or parameters
+    url = neo4j_url or os.getenv("NEO4J_URL", "bolt://localhost:7687")
+    user = neo4j_user or os.getenv("NEO4J_USER", "neo4j")
+    password = neo4j_password or os.getenv("NEO4J_PASSWORD")
+    database = neo4j_database or os.getenv("NEO4J_DATABASE", "neo4j")
+
+    if not password:
+        error_msg = "Neo4j password not provided. Set NEO4J_PASSWORD environment variable or pass neo4j_password parameter."
+        if ctx:
+            await ctx.error(error_msg)
+        return {"success": False, "error": error_msg}
+
+    # Get OpenAI API key
+    api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        error_msg = "OpenAI API key required for question answering. Set OPENAI_API_KEY environment variable or pass openai_api_key parameter."
+        if ctx:
+            await ctx.error(error_msg)
+        return {"success": False, "error": error_msg}
+
+    try:
+        # Create Neo4j service with embeddings enabled for hybrid approach
+        neo4j_service = Neo4JService(
+            uri=url,
+            username=user,
+            password=password,
+            database=database,
+            enable_embeddings=True,
+            openai_api_key=api_key,
+        )
+
+        if ctx:
+            await ctx.debug(
+                "Running hybrid question answering (graph query + vector search fallback)"
+            )
+
+        # Run hybrid question answering
+        result = neo4j_service.answer_question(question)
+
+        # Close connection
+        neo4j_service.close()
+
+        if ctx:
+            if result.get("success"):
+                method = result.get("method", "unknown")
+                await ctx.info(f"Successfully answered question using: {method}")
+            else:
+                await ctx.error(f"Failed to answer question: {result.get('error')}")
+
+        return result
+
+    except Exception as e:
+        error_msg = f"Error answering question: {str(e)}"
+        if ctx:
+            await ctx.error(error_msg)
+        return {"success": False, "error": error_msg}
+
+
 def main():
     """Run the MCP server."""
     mcp.run(transport="streamable-http")

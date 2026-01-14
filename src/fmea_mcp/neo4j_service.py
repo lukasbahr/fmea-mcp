@@ -3,11 +3,13 @@ Neo4J Service for FMEA Graph Management
 """
 
 import pandas as pd
+import json
 from typing import Optional
 from neo4j import GraphDatabase
 from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Neo4jVector
 from langchain_community.graphs import Neo4jGraph
+from openai import OpenAI
 
 
 class Neo4JService:
@@ -51,6 +53,13 @@ class Neo4JService:
         self.enable_embeddings = enable_embeddings
         self.vector_store = None
         self.graph = None
+        self.openai_client = None
+        self.openai_api_key = openai_api_key
+        self.top_k = 3
+
+        # Initialize context for QA
+        self.context_cypher = []
+        self.context_qa = []
 
         if enable_embeddings:
             if not openai_api_key:
@@ -59,6 +68,9 @@ class Neo4JService:
                 )
 
             try:
+                # Initialize OpenAI client
+                self.openai_client = OpenAI(api_key=openai_api_key)
+
                 # Initialize embeddings
                 self.embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
 
@@ -553,3 +565,303 @@ class Neo4JService:
 
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def get_schema(self) -> str:
+        """
+        Get the Neo4j graph schema for Cypher query generation.
+
+        Returns:
+            str: Graph schema description
+        """
+        try:
+            if self.graph:
+                return self.graph.schema
+
+            # Fallback: manually construct schema
+            schema_query = """
+            CALL db.schema.visualization()
+            """
+            result = self.query(schema_query)
+            return (
+                str(result)
+                if result
+                else "FMEA graph with nodes: FailureMode, ProcessStep, FailureEffect, FailureCause, FailureMeasure"
+            )
+        except Exception as e:
+            # Return basic schema as fallback
+            return """
+            Graph Schema:
+            Nodes:
+            - FailureMode (properties: FailureMode, RPN)
+            - ProcessStep (properties: ProcessStep)
+            - FailureEffect (properties: FailureEffect, S)
+            - FailureCause (properties: FailureCause, O)
+            - FailureMeasure (properties: FailureMeasure, DetectionMeasure, D)
+            
+            Relationships:
+            - (FailureMode)-[:occursAtProcessStep]->(ProcessStep)
+            - (FailureMode)-[:resultsInFailureEffect]->(FailureEffect)
+            - (FailureMode)-[:isDueToFailureCause]->(FailureCause)
+            - (FailureCause)-[:isImprovedByFailureMeasure]->(FailureMeasure)
+            """
+
+    def cypher_prompt_context(self, question: str):
+        """
+        Add question to Cypher generation context.
+
+        Args:
+            question: User question
+        """
+        schema = self.get_schema()
+
+        self.context_cypher = [
+            {
+                "role": "system",
+                "content": f"""You are a Neo4j Cypher query expert for FMEA (Failure Mode and Effects Analysis) data.
+                
+Graph Schema:
+{schema}
+
+Generate valid Cypher queries based on user questions. Return ONLY the Cypher query, no explanations.
+If the question cannot be answered with a graph query, return: NO_QUERY
+
+Important:
+- Use MATCH patterns that match the schema
+- Return relevant nodes and their properties
+- Limit results to top 10 unless specified
+- Use WHERE clauses for filtering
+- Return data in a structured format""",
+            },
+            {
+                "role": "user",
+                "content": f"Generate a Cypher query to answer: {question}",
+            },
+        ]
+
+    def run_inference(self, messages: list, temperature: float = 0.0) -> object:
+        """
+        Run OpenAI inference.
+
+        Args:
+            messages: List of messages for the chat completion
+            temperature: Sampling temperature
+
+        Returns:
+            OpenAI chat completion response
+        """
+        if not self.openai_client:
+            raise ValueError("OpenAI client not initialized")
+
+        return self.openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=temperature,
+        )
+
+    def extract_cypher(self, response: str) -> Optional[str]:
+        """
+        Extract Cypher query from LLM response.
+
+        Args:
+            response: LLM response text
+
+        Returns:
+            Extracted Cypher query or None
+        """
+        if "NO_QUERY" in response:
+            return None
+
+        # Remove markdown code blocks if present
+        response = response.strip()
+        if response.startswith("```"):
+            lines = response.split("\n")
+            # Remove first and last lines (markdown markers)
+            response = "\n".join(lines[1:-1])
+
+        # Remove 'cypher' language identifier if present
+        response = response.replace("cypher", "").strip()
+
+        return response if response else None
+
+    def validate_cypher(self, cypher: Optional[str]) -> bool:
+        """
+        Validate if a Cypher query is safe and syntactically correct.
+
+        Args:
+            cypher: Cypher query to validate
+
+        Returns:
+            bool: True if valid, False otherwise
+        """
+        if not cypher:
+            return False
+
+        # Basic safety checks
+        dangerous_keywords = [
+            "DELETE",
+            "REMOVE",
+            "SET",
+            "CREATE",
+            "MERGE",
+            "DROP",
+            "DETACH",
+        ]
+        upper_cypher = cypher.upper()
+
+        for keyword in dangerous_keywords:
+            if keyword in upper_cypher:
+                return False
+
+        # Check if it's a read-only query
+        if not any(keyword in upper_cypher for keyword in ["MATCH", "RETURN", "WITH"]):
+            return False
+
+        # Try to execute with EXPLAIN to validate syntax
+        try:
+            self.query(f"EXPLAIN {cypher}")
+            return True
+        except Exception:
+            return False
+
+    def summarize_context(self, context: str, question: str) -> dict:
+        """
+        Create a summarization prompt for context.
+
+        Args:
+            context: Context data to summarize
+            question: Original question
+
+        Returns:
+            dict: Message for summarization
+        """
+        return {
+            "role": "user",
+            "content": f"""Given this FMEA data context:
+{context}
+
+And the question: {question}
+
+Extract and summarize only the relevant information that helps answer the question.
+Be concise but include key details like failure modes, causes, effects, RPN values, and measures.""",
+        }
+
+    def qa_prompt_context(self, question: str, context: str):
+        """
+        Add question and context to QA context.
+
+        Args:
+            question: User question
+            context: Summarized context
+        """
+        self.context_qa = [
+            {
+                "role": "system",
+                "content": """You are an FMEA (Failure Mode and Effects Analysis) expert assistant.
+Answer questions based on the provided context from the FMEA knowledge graph.
+
+Provide clear, accurate answers that:
+- Reference specific failure modes, causes, effects, and measures
+- Include RPN (Risk Priority Number) values when relevant
+- Explain severity (S), occurrence (O), and detection (D) ratings when applicable
+- Suggest practical insights or recommendations when appropriate
+
+If the context doesn't contain enough information, say so clearly.""",
+            },
+            {
+                "role": "user",
+                "content": f"""Context from FMEA database:
+{context}
+
+Question: {question}
+
+Please provide a detailed answer based on the context.""",
+            },
+        ]
+
+    def answer_question(self, question: str) -> dict:
+        """
+        Run answer question RAG service using hybrid approach.
+        First tries graph query, then falls back to vector search if unsuccessful.
+
+        Args:
+            question: The question to answer
+
+        Returns:
+            dict: The answer, context, and metadata
+        """
+        if not self.openai_client:
+            return {
+                "success": False,
+                "error": "OpenAI client not initialized. Enable embeddings with an OpenAI API key.",
+            }
+
+        try:
+            # List pre answers
+            pre_answer = []
+            query_result = None
+            method_used = None
+
+            # Add question to cypher context
+            self.cypher_prompt_context(question)
+
+            # Run inference to generate Cypher query
+            result = self.run_inference(self.context_cypher)
+
+            # Extract cypher query
+            cypher_query = self.extract_cypher(result.choices[0].message.content)
+
+            # Check if cypher query is valid
+            if self.validate_cypher(cypher_query):
+                query_result = self.query(cypher_query)
+                if query_result and len(query_result) > 0:
+                    method_used = "graph_query"
+                    if len(query_result) > self.top_k:
+                        query_result = query_result[: self.top_k]
+
+            # Fallback to vector search if graph query unsuccessful
+            if not query_result:
+                if not self.enable_embeddings:
+                    return {
+                        "success": False,
+                        "error": "Graph query unsuccessful and vector search not available. Enable embeddings for fallback search.",
+                    }
+
+                # Vector search
+                results = self.similarity_search(question, k=self.top_k)
+                if results:
+                    query_result = [result.page_content for result in results]
+                    method_used = "vector_search"
+                else:
+                    return {
+                        "success": False,
+                        "error": "No results found from graph query or vector search",
+                    }
+
+            # Summarize the query results for further processing
+            for result in query_result:
+                result_summarize = self.run_inference(
+                    [
+                        self.summarize_context(
+                            context=json.dumps(result), question=question
+                        )
+                    ]
+                )
+                pre_answer.append(result_summarize.choices[0].message.content)
+
+            # Add question and context to QA context
+            self.qa_prompt_context(question, json.dumps(pre_answer))
+
+            # Run inference to generate final answer
+            answer = self.run_inference(list(self.context_qa), temperature=1.0)
+
+            return {
+                "success": True,
+                "answer": answer.choices[0].message.content,
+                "context": pre_answer,
+                "context_raw": query_result,
+                "method": method_used,
+                "cypher_query": cypher_query if method_used == "graph_query" else None,
+            }
+
+        except Exception as e:
+            return {"success": False, "error": f"Error answering question: {str(e)}"}
